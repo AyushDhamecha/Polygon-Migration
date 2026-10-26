@@ -149,6 +149,7 @@ def index(request):
                 context['db_problem'] = db_problem
                 # Always show the tags currently attached to the problem
                 context['selected_tags'] = [tag.tag_name for tag in db_problem.extra_tags.all()]
+                context['selected_tags_json'] = json.dumps(context['selected_tags'])
                 # Fetch the difficulty from the database if present
                 context['difficulty'] = db_problem.difficulty
                 # Also fetch main solution if not already set
@@ -321,6 +322,26 @@ def index(request):
                         'notes': notes,
                     }
                     
+                    # Fetch main reference solution for review if not already loaded
+                    if 'main_solution' not in context:
+                        try:
+                            solutions = api._make_request('problem.solutions', {'problemId': polygon_id})
+                            if solutions:
+                                main_solution_name = None
+                                for sol in solutions:
+                                    if sol.get('tag') == 'MA':
+                                        main_solution_name = sol['name']
+                                        break
+                                if not main_solution_name and solutions:
+                                    main_solution_name = solutions[0]['name']
+                                if main_solution_name:
+                                    context['main_solution'] = api._make_plain_request('problem.viewSolution', {
+                                        'problemId': polygon_id,
+                                        'name': main_solution_name
+                                    })
+                        except Exception as e:
+                            logger.debug('Main solution not available yet: %s', e)
+                    
                     # Handle database migration
                     if migrate_to_db:
                         # Validate that difficulty is provided
@@ -413,6 +434,7 @@ def index(request):
                         # Update context with current tags for display
                         final_tags = [tag.tag_name for tag in problem_obj.extra_tags.all()]
                         context['selected_tags'] = final_tags
+                        context['selected_tags_json'] = json.dumps(final_tags)
                         logger.debug('Final tags after processing: %s', final_tags)
 
                         # Get test cases from Redis instead of fetching from Polygon again
