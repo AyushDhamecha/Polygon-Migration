@@ -197,11 +197,11 @@ def index(request):
                             return render(request, 'problems/index.html', context)
                         
                         logger.info('Problem found in DB, proceeding with storage migration')
-                        # Storage paths use the database problem ID, not the Polygon ID
-                        problem_id = problem_obj.id
-                        logger.info('Storage migration params: problem_id=%s, provider=%s', problem_id, settings.STORAGE_PROVIDER)
+                        # Storage paths must use the Polygon problem ID so files land at
+                        # test_cases/{polygon_id}/{test_number} as required by the spec.
+                        logger.info('Storage migration params: polygon_id=%s, provider=%s', polygon_id, settings.STORAGE_PROVIDER)
                         
-                        api.delete_problem_test_case_cache(problem_id)
+                        api.delete_problem_test_case_cache(polygon_id)
                         
                         # Check for custom checker before migration
                         custom_checker_info = api.get_custom_checker_info(polygon_id)
@@ -211,9 +211,9 @@ def index(request):
                         
                         logger.info('Calling migrate_to_storage')
                         try:
-                            storage_problem_id = problem_id
+                            storage_problem_id = polygon_id
                             storage_uploaded = True
-                            api.migrate_to_storage(polygon_id, problem_id)
+                            api.migrate_to_storage(polygon_id, polygon_id)
                         except Exception as e:
                             logger.error('Storage migration failed: %s', e, exc_info=True)
                             context['error'] = f"Cloud storage migration failed: {str(e)}"
@@ -568,7 +568,8 @@ def index(request):
             except Exception as e:
                 logger.error('Exception in index view: %s', e, exc_info=True)
                 context['error'] = f"Migration failed and all changes have been rolled back. Reason: {str(e)}"
-                # Remove partially uploaded files so storage doesn't diverge from the rolled-back DB
+                # Remove partially uploaded files so storage doesn't diverge from the rolled-back DB.
+                # storage_problem_id is the Polygon ID (e.g. '615237'), matching the folder name.
                 if storage_uploaded and storage_problem_id:
                     try:
                         from problems.storage import get_storage
