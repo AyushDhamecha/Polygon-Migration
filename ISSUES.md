@@ -18,9 +18,9 @@ Below are the 3 most critical Product Issues and 3 most critical Code Issues, ra
 | **Product** | **P1** | Silent Data Corruption, Stale Records, and False Success Reporting | **Critical** | The system claims success while skipping tests, truncating data, and retaining dead test cases. |
 | **Product** | **P2** | Broken Problem Statement Rendering & Non-Functional Tagging | **High** | Math appears as unparsed LaTeX code; tag selection is broken due to frontend/backend field mismatches. |
 | **Product** | **P3** | Storage ID Mismatch & Fragile Synchronous Re-fetches | **High** | Files stored under DB primary key instead of Polygon ID; blocking HTTP calls cause gateway timeouts. |
-| **Code** | **C1** | Monolithic 470-Line View Routed by Hidden Form Flags | **High** | Single view function does all jobs; impossible to test, maintain, or decouple. |
-| **Code** | **C2** | Positional Array Indexing Instead of True Entity Synchronization | **High** | Test identity tied to loop index rather than unique IDs, directly causing ghost rows. |
-| **Code** | **C3** | Overloaded `PolygonAPI` Class That Conceals Fatal Errors | **High** | Service mixes HTTP, ZIP extraction, C++ compilation, and cloud storage while swallowing exceptions. |
+| **Code** | **C1** | Swallowed Errors and a Poisoned Cache Cause Silent Test-Case Loss | **Critical** | Failed fetches become empty tests that are cached, silently skipped, and reported as success. |
+| **Code** | **C2** | Positional Index Sync and Inconsistent Numbering Between DB and Storage | **High** | Tests are matched by loop position, causing ghost rows and a wrong DB-to-storage file mapping. |
+| **Code** | **C3** | Non-Atomic Storage/DB/Cache Operations With No Concurrency Control | **High** | Files are deleted before upload and rollback wipes good uploads; concurrent runs corrupt each other. |
 
 ---
 
@@ -104,73 +104,175 @@ Ranked **#3** because while operations can succeed on small test sets, the archi
 
 ## 3. Backend Code Issues
 
-### [C1] Monolithic 470-Line View Routed by Hidden Form Flags
+### [C1] Swallowed Errors and a Poisoned Cache Cause Silent Test-Case Loss
 
-- **Severity:** High
-- **Location:** `problems/views.py` (lines 87–570, `def index`), `problems/urls.py`
+**Severity**: Critical
 
-#### Problem
-The entire lifecycle of the application—fetching data, updating problem models, storing sample previews, generating problem test cases, compiling checkers, and dispatching cloud uploads—is packed inside a single 470-line view function (`index()`).
-Different actions are chosen by inspecting mutually exclusive POST parameters (`migrate_to_db`, `migrate_to_storage`, `migrate_test_cases_to_db`). Each branch re-executes parts of the fetch pipeline, manipulates the DOM context, and renders the same template.
+**Location**:
+- `problems/polygon_api.py → get_all_test_cases()` (per-test `except Exception`)
+- `problems/polygon_api.py → get_test_cases()` (returns `[]` on any error)
+- `problems/polygon_api.py → get_test_cases_from_redis()` (returns a partial list)
+- `problems/polygon_api.py → upload_custom_checker()` / `compile_custom_checker()`
+- `problems/views.py → index()` (`test_case_count = len(api.get_test_cases(...))`, `if input_data and output_data`, checker success message)
 
-#### Impact
-- Violates the Single Responsibility Principle.
-- Unit testing individual actions is nearly impossible without mocking the entire Polygon API and Redis cache infrastructure.
-- Modifying or debugging one action (e.g., tag persistence) risks breaking unrelated actions (e.g., storage file deletion).
+**Description**:
+A failure at any step is logged and turned into an empty value. The empty value then travels through the cache and the view until it is skipped, so the user sees a green banner.
 
-#### Recommended Improvement
-Split the monolithic view into clean, dedicated RESTful endpoints or view functions:
-- `POST /problems/fetch/` &rarr; Fetches and caches problem data.
-- `POST /problems/<id>/migrate-metadata/` &rarr; Saves problem statement and tags.
-- `POST /problems/<id>/migrate-testcases-db/` &rarr; Generates DB previews.
-- `POST /problems/<id>/migrate-storage/` &rarr; Enqueues the cloud storage upload job.
-
----
-
-### [C2] Positional Array Indexing Instead of Entity Synchronization
-
-- **Severity:** High
-- **Location:** `problems/views.py` (lines 438–450, 515–535), `problems/models.py`
-
-#### Problem
-Test cases are identified and persisted based on their numerical loop index:
 ```python
-order = index + 1
-# Overwrites existing row with matched order
+# polygon_api.py: get_all_test_cases()
+except Exception as e:
+    logger.warning(f"Error fetching test case {test_index}: {e}")
+    test_case['input'] = ''
+    test_case['output'] = ''
 ```
-There is no concept of a unique Polygon test identifier or hash. The code simply assumes that the $i$-th test returned by the API today is the exact same entity as the $i$-th test stored yesterday. If a setter deletes or reorders tests, tests with different semantics overwrite existing numbers, and orphaned rows with higher indexes are never deleted.
+The broken test is appended to the list, then cached in Redis for 30 minutes (`store_test_cases_in_redis`). Every later migrate click reads the *same broken data* from the cache and never retries Polygon.
 
-#### Impact
-This design is the direct technical cause of issue P1 and Edge Case Q2. It makes idempotent synchronization impossible and causes discrepancy between the database preview count and the actual files present in cloud storage.
+```python
+# views.py: index()
+if input_data and output_data:
+    ...            # empty test is silently skipped
+```
 
-#### Recommended Improvement
-- Add a `polygon_test_id` or `test_hash` column to `ProblemTestCase`.
-- In the migration loop, collect the set of active IDs, upsert matched records, and explicitly run `ProblemTestCase.objects.filter(problem=problem).exclude(id__in=active_ids).delete()`.
+```python
+# polygon_api.py: get_test_cases()
+except Exception:
+    return []
+# views.py
+test_case_count = len(api.get_test_cases(polygon_id))   # a network blip saves test_case_count = 0
+```
+
+```python
+# polygon_api.py: get_test_cases_from_redis()
+if test_case_data:
+    ...
+else:
+    logger.warning(f"Missing test case {idx} in Redis ...")   # only a warning
+return test_cases                                             # shorter list returned as if complete
+```
+If one key expires or is evicted between reads, a shorter list is returned and migrated.
+
+```python
+# views.py: custom checker message is added whenever a checker exists, never checking the outcome
+success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
+# polygon_api.py: compile failure -> returns None -> uploads raw .cpp -> returns normally
+```
+`upload_custom_checker()` returns `None` on every failure path, so the view cannot tell success from failure.
+
+**Impact**:
+- A transient Polygon error or rate limit yields a migration that reports success while tests are missing, empty, or counted as 0.
+- The bad result is cached, so retrying within 30 minutes reproduces the same corruption.
+- Judges grade submissions against an incomplete test set. This is the worst failure mode for a migration tool because nothing signals the problem.
+- The checker message can claim a compiled binary was uploaded when only the source was.
+
+**Suggested Fix**:
+1. Define explicit exceptions (`PolygonError`, `TestFetchError`, `CheckerCompileError`) and stop catching `Exception` inside the service layer. Let failures bubble up to one place that decides what to do.
+2. In `get_all_test_cases()`, retry with backoff, then **raise** if a test still fails. Never substitute `''`.
+3. Only write to Redis after the full list is valid. Treat a missing key or `len(list) != count` as a **cache miss**, not a partial hit.
+4. Take `test_case_count` from the list already fetched (`len(all_test_cases)`), not from a second API call that hides errors.
+5. Have `upload_custom_checker()` return a result object (`compiled`, `uploaded_as`, `error`). Show the real outcome, or fail the migration with the compiler output.
+6. Return a migration report (`expected`, `uploaded`, `skipped`, `errors`) and render it instead of one generic success line.
 
 ---
 
-### [C3] Overloaded `PolygonAPI` Class That Conceals Fatal Errors
+### [C2] Positional Index Sync and Inconsistent Numbering Between DB and Storage
 
-- **Severity:** High
-- **Location:** `problems/polygon_api.py` (930 lines)
+**Severity**: High
 
-#### Problem
-The `PolygonAPI` class combines half a dozen distinct responsibilities into one file:
-1. Low-level HTTP request signing (SHA-512 with random prefix).
-2. Polygon REST API calls.
-3. Package ZIP archive download, extraction, and file parsing.
-4. C++ compilation using local host compilers (`g++`).
-5. Redis cache reading and serialization.
-6. Cloud storage orchestration and file uploads.
+**Location**:
+- `problems/views.py → index()` (`migrate_to_db` sample-case loop and `migrate_test_cases_to_db` loop)
+- `problems/polygon_api.py → migrate_to_storage()` (`enumerate(test_cases, start=1)`)
 
-Throughout this class, errors are caught with generic `except Exception:`, logged with `logger.error()`, and swallowed by returning `None` or continuing loops. For example, checker compilation errors are caught and logged, leaving caller code under the impression that compilation succeeded.
+**Description**:
+Test identity is the loop position, not a stable ID, and the DB and storage use *different* counters.
 
-#### Impact
-Violates separation of concerns. Makes mocking and maintenance difficult. Swallowed exceptions prevent callers from handling failures gracefully, turning hard infrastructure errors into silent runtime anomalies.
+```python
+# views.py: migrate_test_cases_to_db
+for idx, test in enumerate(test_cases):
+    ...
+    if input_data and output_data:
+        if idx < len(existing_test_cases):
+            ptc = existing_test_cases[idx]      # row chosen by loop position
+            ...
+            ptc.order = order
+        ...
+        order += 1                              # only incremented when a test is kept
+```
+```python
+# polygon_api.py: migrate_to_storage
+for idx, test in enumerate(test_cases, start=1):
+    if input_data and output_data:
+        storage.upload_test_case(problem_id_for_naming, idx, input_data, output_data)
+```
+Example: Polygon has tests 1 to 5 and test 3 has empty output.
+- Storage files: `1, 2, 4, 5` (uses `idx`, leaving a gap)
+- DB `order`: `1, 2, 3, 4` (uses a compacted counter)
 
-#### Recommended Improvement
-- Break `PolygonAPI` into dedicated modular services: `PolygonClient` (pure API communication), `PackageExtractor` (ZIP handling), `CheckerCompiler` (sandboxed compilation), and `MigrationService` (orchestration).
-- Eliminate silent error suppression: let infrastructure and compilation exceptions bubble up to transaction boundaries so failures are reported transparently.
+DB test #3 is now storage file `4`. The same pattern is used for `SampleTestCase`, and nothing deletes rows beyond the new length. If Polygon shrinks from 20 tests to 12, 8 stale rows stay. This also applies to sample cases, so a problem that loses a sample still displays the old one.
+
+**Impact**:
+- Ghost rows survive re-migration (rows 13 to 20 in the 20-to-12 case).
+- Anything joining DB rows to storage files by number gets the wrong pair.
+- Reordering tests on Polygon silently overwrites unrelated rows with different content.
+- Re-running is not idempotent. The result depends on what happened to be stored before.
+
+**Suggested Fix**:
+1. Polygon already returns a stable `index` for each test. Add `polygon_test_index` to `ProblemTestCase` and `SampleTestCase`, with `unique_together = (problem, polygon_test_index)`.
+2. Use that same index for the storage filename and the DB `order`, so one number means one test everywhere.
+3. Sync inside a transaction: upsert by `polygon_test_index`, collect the active set, then `.exclude(polygon_test_index__in=active).delete()`.
+4. Do not skip empty tests silently. A test with empty output can be valid. Either store it or abort with a clear error.
+5. Use `bulk_create` / `bulk_update` instead of per-row `save()` (this removes an N+1 write pattern as well).
+
+---
+
+### [C3] Non-Atomic Storage/DB/Cache Operations With No Concurrency Control
+
+**Severity**: High
+
+**Location**:
+- `problems/polygon_api.py → migrate_to_storage()` (delete, then upload)
+- `problems/views.py → index()` (`transaction.atomic()` block and `except` cleanup)
+- `problems/polygon_api.py → compile_custom_checker()` / `upload_custom_checker()` (fixed filenames in a shared directory)
+
+**Description**:
+Three related problems with cross-system consistency.
+
+**(a) Delete-before-upload.**
+```python
+storage.delete_problem_files(problem_id_for_naming)   # old good files gone
+for idx, test in enumerate(test_cases, start=1):
+    storage.upload_test_case(...)                     # a failure here leaves a partial set
+```
+
+**(b) The rollback deletes files that were uploaded successfully.** The storage upload and the preview fetch share one `try`:
+```python
+api.migrate_to_storage(polygon_id, polygon_id)        # succeeds
+...
+problem_html_content = api.download_and_extract_package(polygon_id)   # display-only step, can fail
+...
+except Exception as e:
+    get_storage().delete_problem_files(storage_problem_id)            # wipes the good upload
+```
+A failure in a *display-only* step (for example "No READY package") triggers the cleanup, leaving storage empty for a problem that still exists in the DB. The message says "all changes have been rolled back", which is only true for the database. `transaction.atomic()` also stays open across minutes of network I/O.
+
+**(c) No locking, and shared fixed filenames.**
+```python
+source_file = os.path.join(temp_dir, 'custom_checker.cpp')   # temp_dir = CUSTOM_CHECKER_DIR
+binary_file = os.path.join(temp_dir, binary_filename)        # 'custom_checker'
+```
+Two staff members migrating different problems at the same time overwrite each other's checker source and binary. Problem A's binary can be uploaded under problem B's path. A double click on the same button has the same effect on test files.
+
+**Impact**:
+- A live problem can end up with zero or partial test files in storage.
+- Wrong checker binaries can be uploaded, so valid submissions get a Wrong Answer verdict.
+- Concurrent or repeated clicks cause interleaved deletes and uploads.
+- The DB, storage and cache can all disagree, with an error message that hides this.
+
+**Suggested Fix**:
+1. Upload to a staging prefix (`test_cases/{id}/.staging-<uuid>/`), verify the count, then swap or promote. Delete the old files only after the new set is complete.
+2. Move the preview fetch out of the storage `try`, or make cleanup delete only what *this* run created.
+3. Do not hold `transaction.atomic()` around network calls. Fetch everything first, then write to the DB in one short transaction.
+4. Take a per-problem lock (Redis `SET NX EX`, or `select_for_update` on the `Problem` row) and reject a second concurrent migration for the same `polygon_id`.
+5. Always compile in `tempfile.TemporaryDirectory()` and drop the shared `CUSTOM_CHECKER_DIR` branch. It also removes about 60 lines of duplicated code.
 
 ---
 
