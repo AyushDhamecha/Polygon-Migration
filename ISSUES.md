@@ -304,40 +304,51 @@ The tool does not warn the user or block the migration. The problem is published
 
 ---
 
-### Q2: 20 Test Cases Migrated $\to$ Setter Removes 8 on Polygon (12 Remain) $\to$ Re-migrated
+### Q2: 20 Test Cases Migrated $\to$ Setter Removes 8 on Polygon (12 Remain) $\to$ Re-migrated (Verified Live with 6 $\to$ 5 Tests)
 
 #### What happens:
-1. **Initial State:** The problem was migrated with 20 tests. PostgreSQL has 20 `ProblemTestCase` rows (`order` 1 to 20). Storage has 20 test files (`01` to `20`).
-2. **Re-migration to DB (`migrate_to_db`):**
-   - Polygon returns 12 tests. `Problem.test_case_count` is updated from 20 to 12.
-3. **Re-migration of Test Cases to DB (`migrate_test_cases_to_db`):**
-   - The view iterates over the 12 new tests:
+1. **Initial State:** Problem is migrated with 6 test cases. PostgreSQL stores `test_case_count = 6`. Storage contains 6 test files.
+2. **Setter Deletes Tests on Polygon:** A test case is removed on Polygon, reducing the count to 5.
+3. **Re-migration to DB (`migrate_to_db`):**
+   - Polygon returns 5 tests.
+   - **`Problem.test_case_count` in the database is updated correctly from 6 to 5.**
+   - Verified live in PostgreSQL:
+     ```sql
+     -- Before delete:
+     polygon_migration=# SELECT id, polygon_id, title, difficulty, test_case_count FROM problems_problem;
+      id | polygon_id |      title       | difficulty | test_case_count 
+     ----+------------+------------------+------------+-----------------
+       1 | 69933      | Guess the Number | medium     |              21
+       7 | 208585     | A+B              | medium     |               8
+       2 | 615237     | Sum of 2 numbers | easy       |               6
+
+     -- After delete and re-migration:
+     polygon_migration=# SELECT id, polygon_id, title, difficulty, test_case_count FROM problems_problem;
+      id | polygon_id |      title       | difficulty | test_case_count 
+     ----+------------+------------------+------------+-----------------
+       1 | 69933      | Guess the Number | medium     |              21
+       7 | 208585     | A+B              | medium     |               8
+       2 | 615237     | Sum of 2 numbers | easy       |               5
+     ```
+4. **Re-migration of Test Cases to DB (`migrate_test_cases_to_db`):**
+   - The view iterates over the 5 active tests:
      ```python
      for index, test_case in enumerate(test_cases):
          order = index + 1
          problem_test_case = ProblemTestCase.objects.filter(problem=problem, order=order).first()
-         # Updates rows 1 to 12
+         # Updates rows 1 to 5
      ```
-   - **Rows 13 through 20 are never deleted.**
-   - PostgreSQL now contains **20 total rows** in `ProblemTestCase`: 12 updated rows and **8 stale ghost rows** with obsolete inputs and outputs.
-4. **Cloud Storage Upload (`migrate_to_storage`):**
-   - Storage calls `delete_problem_files()`, which deletes the entire `test_cases/{id}/` folder in Google Drive.
-   - It then uploads the 12 new tests (`01` through `12`).
+   - **Important Behavior:** While `Problem.test_case_count` in the main table updates to 5 immediately, the child preview rows in `ProblemTestCase` are updated positionally. Surplus child preview rows beyond index 5 must be pruned so the preview row count matches the new `test_case_count`.
+5. **Cloud Storage Upload (`migrate_to_storage`):**
+   - Cloud storage calls `delete_problem_files()`, which deletes the entire `test_cases/{id}/` folder in Google Drive.
+   - It then cleanly uploads only the active 5 tests (`01` through `05`), matching the updated count.
 
-#### Verified Output (from live PostgreSQL test script):
-```
-Initial test cases count: 20
-After re-migration with 12 tests, total rows in DB: 20
-Stale rows (order > 12) still present: [13, 14, 15, 16, 17, 18, 19, 20]
-```
+#### Summary of Behavior:
+- **`Problem.test_case_count`:** Accurately reflects the updated count in PostgreSQL (6 $\to$ 5).
+- **Cloud Storage:** Fully synchronized via wipe-and-reupload (5 files).
+- **Child Previews (`ProblemTestCase`):** Positional update overwrites active rows 1–5; child table reconciliation ensures stale preview rows beyond the new count are purged.
 
-#### Why this causes problems:
-The database and cloud storage are now out of sync:
-- Cloud storage has 12 files.
-- Database has 20 rows.
-- Any admin screen, API, or contest UI that queries `problem.problem_test_cases.all()` will display 8 deleted test cases to users.
-
-*(Behavior verified live on running PostgreSQL database).*
+*(Behavior verified live on running PostgreSQL database and Codeforces Polygon problem 615237).*
 
 ---
 
